@@ -16,12 +16,39 @@
 #include <errno.h>     /* program_invocation_short_name */
 
 #include "util.h"
+#include <vector>
+#include <sched.h>
 #include "../verifiable/verifiable.h"
 
 #pragma weak ncclCommWindowRegister
 #pragma weak ncclCommWindowDeregister
 #pragma weak ncclDevCommCreate
 #pragma weak ncclDevCommDestroy
+
+// Add this global variable to control affinity mode
+int affinity_mode = -1; // 1: 1 core/thread, 2: 2 cores/thread, 4: 4 cores/thread
+// You can set affinity_mode from an environment variable in main()
+void set_affinity_mode_from_env() {
+  char* env = getenv("NCCL_TESTS_AFFINITY_MODE");
+  if (env) {
+    int mode = atoi(env);
+    affinity_mode = mode;
+  }
+}
+
+// Returns a vector of core IDs for a given thread index, total threads, and affinity mode
+std::vector<int> get_core_map(int thread_id, int nThreads, int affinity_mode) {
+    int total_cores = 128;
+    std::vector<int> cores;
+    int total_groups = nThreads * (affinity_mode > 0 ? affinity_mode : 1);
+    int group_size = affinity_mode > 0 ? affinity_mode : 1;
+    int start = thread_id * group_size;
+    for (int i = 0; i < group_size; ++i) {
+        int core_id = (start + i) * total_cores / total_groups;
+        cores.push_back(core_id);
+    }
+    return cores;
+}
 
 #define DIVUP(x, y) \
     (((x)+(y)-1)/(y))
@@ -714,6 +741,28 @@ testResult_t threadRunTests(struct threadArgs* args) {
   // Set device to the first of our GPUs. If we don't do that, some operations
   // will be done on the current GPU (by default : 0) and if the GPUs are in
   // exclusive mode those operations will fail.
+  char hostname[1024];
+  getHostName(hostname, 1024);
+
+  if (args->thread == 0) {
+    if (affinity_mode != -1) {
+    // Set CPU affinity: pin thread to core (thread->args.thread + 1)
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    
+    // Dynamic core mapping
+    std::vector<int> core_map = get_core_map(args->thread, args->nThreads, affinity_mode);
+    for (int core_id : core_map) {
+        CPU_SET(core_id, &cpuset);
+    }
+    printf("[%s %d:%ld] RunTest Thread %d Forced to bind to cores: ", hostname, getpid(), pthread_self(), args->thread);
+    for (size_t idx = 0; idx < core_map.size(); ++idx) {
+      printf("%d%s", core_map[idx], (idx < core_map.size() - 1) ? "," : "\n");
+    }
+    pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+    }
+  }
+  printf("[%s %d:%ld] RunTest for thread %ld on CPU core %d\n", hostname, getpid(), pthread_self(), args->thread, sched_getcpu());
   CUDACHECK(cudaSetDevice(args->gpus[0]));
   TESTCHECK(ncclTestEngine.runTest(args, ncclroot, (ncclDataType_t)nccltype, test_typenames[nccltype], (ncclRedOp_t)ncclop, test_opnames[ncclop]));
   return testSuccess;
@@ -792,6 +841,27 @@ testResult_t threadInit(struct threadArgs* args) {
 
 void* threadLauncher(void* thread_) {
   struct testThread* thread = (struct testThread*)thread_;
+  int thread_id = thread->args.thread;
+  char hostname[1024];
+  gethostname(hostname, 1024);
+  printf("[%s %d:%ld] RunTest Thread launcher initiated for thread %ld on CPU core %d\n", hostname, getpid(), pthread_self(), thread_id, sched_getcpu());
+  if (affinity_mode != -1) {
+    // Set CPU affinity: pin thread to core (thread->args.thread + 1)
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    
+    // Dynamic core mapping
+    std::vector<int> core_map = get_core_map(thread_id, thread->args.nThreads, affinity_mode);
+    for (int core_id : core_map) {
+        CPU_SET(core_id, &cpuset);
+    }
+    printf("[%s %d:%ld] RunTest Thread %d Forced to bind to cores: ", hostname, getpid(), pthread_self(), thread_id);
+    for (size_t idx = 0; idx < core_map.size(); ++idx) {
+      printf("%d%s", core_map[idx], (idx < core_map.size() - 1) ? "," : "\n");
+    }
+    pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+    printf("[%s %d:%ld] RunTest for thread %ld on CPU core %d\n", hostname, getpid(), pthread_self(), thread->args.thread, sched_getcpu());
+  }
   thread->ret = thread->func(&thread->args);
   return NULL;
 }
@@ -818,7 +888,7 @@ testResult_t run(); // Main function
 int main(int argc, char* argv[], char **envp) {
   // Make sure everyline is flushed so that we see the progress of the test
   setlinebuf(stdout);
-
+  set_affinity_mode_from_env();
   #if NCCL_VERSION_CODE >= NCCL_VERSION(2,4,0)
     ncclGetVersion(&test_ncclVersion);
   #else
